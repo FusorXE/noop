@@ -107,4 +107,22 @@ final class CollectorStandardHRContactTests: XCTestCase {
             )
         ])
     }
+
+    func testRrFamilyIsCapturedAtIngressAndSurvivesRetry() async {
+        let store = CaptureStore()
+        let collector = Collector(store: store, deviceId: "strap")
+        collector.ingestStandardHR(hr: 60, rr: [1000], family: .whoop5, at: 100)
+        collector.ingestStandardHR(hr: 60, rr: [1001], family: .whoop4, at: 101)
+        collector.ingestStandardHR(hr: 60, rr: [1002], at: 102)
+        store.failNextInsert = true
+        await collector.flushStandardHR()
+        XCTAssertTrue(store.inserted.isEmpty)
+        await collector.flushStandardHR()
+        // A WHOOP 4 standard-BLE beat is labelled now (`whoop4Standard`) where it used to be left
+        // unlabelled: that NULL is what let a partial type-47 offload hide live intervals, so the
+        // assertion moves to the new shape. Only a beat with NO family stays nil.
+        XCTAssertEqual(store.inserted.flatMap(\.rr).map(\.srcChannel),
+                       [.whoop5Standard, .whoop4Standard, nil])
+        XCTAssertEqual(store.inserted.flatMap(\.rr).map(\.rrMs), [1000, 1001, 1002])
+    }
 }

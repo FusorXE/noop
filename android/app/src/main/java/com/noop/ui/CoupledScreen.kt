@@ -45,6 +45,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.noop.analytics.Baselines
+import com.noop.analytics.ChargeBaselines
 import com.noop.analytics.ReadinessEngine
 import com.noop.analytics.RestScorer
 import com.noop.data.DailyMetric
@@ -90,14 +91,8 @@ fun CoupledScreen(
 ) {
     val today by vm.today.collectAsStateWithLifecycle()
     val days by vm.recentDays.collectAsStateWithLifecycle()
-
-    // #614: the Workouts stat must match the Workouts screen, not DailyMetric.exerciseCount (which counts
-    // only strap-DETECTED bouts — a Health-Connect import with auto-detect off read as 0 while the Workouts
-    // screen showed it). vm.workouts is the SAME deduped, dismissed-filtered, all-source list the Workouts
-    // screen renders; loadWorkouts() isn't triggered by opening Coupled, so kick it here (idempotent,
-    // mirrors InsightsScreen).
-    LaunchedEffect(Unit) { vm.loadWorkouts() }
-    val allWorkouts by vm.workouts.collectAsStateWithLifecycle()
+    // #2525: the Charge baselines the engine's rule resolves, the SAME source Today reads.
+    val chargeBaselines by vm.chargeBaselines.collectAsStateWithLifecycle()
 
     // Last night's sleep sessions (imported + computed-only), the SAME resolution SleepScreen uses, keyed on
     // `days` so a sync/import reloads. Only needed for the bed-wake span footnote.
@@ -144,14 +139,8 @@ fun CoupledScreen(
         resolveTodayRow(days, logicalKey, localKey) ?: today
     }
     val todayKey = todayRow?.day ?: logicalKey
-    // #614: count TODAY's workouts by their START's logical day (the SAME 04:00-rollover key DailyMetric.day
-    // uses), so the Coupled stat equals the Workouts overview for today.
-    val workoutsToday = remember(allWorkouts, todayKey) {
-        allWorkouts.count {
-            logicalDay(java.time.Instant.ofEpochSecond(it.startTs).atZone(java.time.ZoneId.systemDefault()))
-                .toString() == todayKey
-        }
-    }
+    // Materialized from the same all-source physiological cycle as Effort, calories, HR, and steps.
+    val workoutsToday = todayRow?.exerciseCount ?: 0
     val context = LocalContext.current
     val hrvEpoch = remember { NoopPrefs.of(context).getLong(Baselines.hrvBaselineEpochKey, 0L).toDouble() }
     // #1458: carry through the SAME helper Today uses, not a local re-derivation. The local copy was
@@ -160,14 +149,15 @@ fun CoupledScreen(
     // older night while the card beside it showed today's number. It also missed the #547 upper bound
     // (a future-dated row from a bad strap clock is how that bug read "12 Jul") and the calibrating gate.
     // One helper, one answer: the card and its own detail sheet cannot disagree again.
-    val carriedRecoveryDay = remember(days, todayKey, todayRow, hrvEpoch, logicalKey, localKey) {
+    val carriedRecoveryDay = remember(days, chargeBaselines, todayKey, todayRow, hrvEpoch, logicalKey, localKey) {
         lastScoredRecoveryDay(
             days = days,
             selectedDayKey = todayKey,
             isToday = true,   // the Coupled view has no day selector; it is always today
             todayScored = todayRow?.recovery != null,
             isCalibrating = recoveryCalibrationNights(
-                days, hasRecovery = todayRow?.recovery != null, hrvBaselineEpoch = hrvEpoch,
+                chargeBaselines?.hrvHistory?.values.orEmpty(), chargeBaselines?.hrvHistory?.dayKeys.orEmpty(),
+                hasRecovery = todayRow?.recovery != null, hrvBaselineEpoch = hrvEpoch,
             ) != null,
             today = maxOf(logicalKey, localKey),
         )
@@ -196,8 +186,11 @@ fun CoupledScreen(
     // Recovery cold-start nights (the SAME pure helper Today's ring reads), for the honest calibrating
     // caption + accessibility copy while the HRV baseline still seeds. Threads the persisted
     // "Recalibrate HRV baseline" epoch so N folds the SAME epoch-aware history the engine folds (Bug B).
-    val calibrationNights = remember(days, todayRow, hrvEpoch) {
-        recoveryCalibrationNights(days, hasRecovery = todayRow?.recovery != null, hrvBaselineEpoch = hrvEpoch)
+    val calibrationNights = remember(chargeBaselines, todayRow, hrvEpoch) {
+        recoveryCalibrationNights(
+            chargeBaselines?.hrvHistory?.values.orEmpty(), chargeBaselines?.hrvHistory?.dayKeys.orEmpty(),
+            hasRecovery = todayRow?.recovery != null, hrvBaselineEpoch = hrvEpoch,
+        )
     }
 
     // The Charge breakdown (the hero's tap target, the EXISTING Today sheet) + the scoring guide it
@@ -239,7 +232,7 @@ fun CoupledScreen(
             dayStrain21 = dayStrain21,
             recovery = recovery,
             calories = todayRow?.activeKcalEst,
-            workouts = workoutsToday,   // #614: real workout count (all sources), not exerciseCount
+            workouts = workoutsToday,
         )
         SleepCard(
             sleepPerformance = sleepPerformance,
@@ -269,6 +262,7 @@ fun CoupledScreen(
         ) {
             ChargeBreakdownSheet(
                 days = days,
+                chargeBaselines = chargeBaselines,
                 displayDay = todayRow,
                 carriedDay = carriedRecoveryDay,
                 showReadiness = true,
@@ -358,6 +352,8 @@ private fun HeroCard(
                         modifier = Modifier
                             .size(232.dp)
                             .alpha(if (isCarrying) 0.8f else 1f),
+                        // Without this the whole 232dp ring, which is most of the card, is a dead zone.
+                        onTap = onTap,
                     )
                     HeroCentre(recovery = recovery, readinessLevel = readinessLevel)
                 }
@@ -596,6 +592,7 @@ private fun SleepCard(
                     tint = Palette.restColor,
                     animated = sleepPerformance != null,
                     modifier = Modifier.size(96.dp),
+                    onTap = onOpenSleep,
                 )
                 if (sleepPerformance != null) {
                     CountUpText(
@@ -720,6 +717,20 @@ internal fun optimalStrainRange(recovery: Double?): OptimalStrainRange? {
 internal fun optimalUpperFraction(recovery: Double?): Double {
     val band = optimalStrainRange(recovery) ?: return 0.0
     return (band.high.toDouble() / 21.0).coerceIn(0.0, 1.0)
+}
+
+/**
+ * The optimal strain band as a 0..1 fraction range of the 0-21 axis, for ring target arcs.
+ * null when recovery is unknown, so the caller renders no target zone.
+ *
+ * Sibling of [optimalUpperFraction], which returns only the upper bound for the tube fill.
+ * This returns the full band as a range, for the GlowRing target arc.
+ */
+internal fun optimalFractionRange(recovery: Double?): ClosedFloatingPointRange<Float>? {
+    val band = optimalStrainRange(recovery) ?: return null
+    val low = (band.low.toDouble() / 21.0).coerceIn(0.0, 1.0).toFloat()
+    val high = (band.high.toDouble() / 21.0).coerceIn(0.0, 1.0).toFloat()
+    return low..high
 }
 
 /** The optimal band as display text ("14 to 18" / the no-data token). Byte-identical to the Swift twin. */

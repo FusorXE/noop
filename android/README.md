@@ -10,7 +10,7 @@ the user owns.
 This is an independent Kotlin / Jetpack Compose reimplementation of the macOS/iOS
 reference app (`Strand/`, Swift). The protocol, framing, and BLE handshake are
 translated from that hardware-verified implementation, not invented here, and kept in
-byte-for-byte parity with it (see the repo root [`CLAUDE.md`](../CLAUDE.md)).
+byte-for-byte parity with it (see the repo root [`AGENTS.md`](../AGENTS.md)).
 
 ---
 
@@ -85,6 +85,10 @@ library, BOM, or the Gradle wrapper:
      testFullDebugUnitTest testDemoDebugUnitTest
    ./gradlew -PstagingRelease assembleFullRelease assembleDemoRelease
    ```
+
+   After switching branches, add `--no-build-cache --rerun-tasks` to the test run. Gradle can serve
+   generated sources (Room DAOs, KSP output) from the branch you came from, so the suite can run
+   against code you do not have checked out.
 
 Never bypass verification or hand-edit the generated lockfile. For a wrapper upgrade, also obtain
 the binary-distribution SHA-256 from Gradle's official checksum reference and regenerate the wrapper
