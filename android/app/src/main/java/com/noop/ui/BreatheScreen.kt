@@ -241,6 +241,14 @@ fun BreatheScreen(viewModel: AppViewModel) {
     }
     val tonePlayer = remember { BreathTonePlayer(context) }
     DisposableEffect(Unit) { onDispose { tonePlayer.release() } }
+    // Keep the realtime HR stream on while this screen is visible (ref-counted in the ViewModel, so
+    // navigating to Live — which also wants it — doesn't stop it). The BPM hero + R-R readouts are
+    // live-derived and shown before a session starts, so the want is unconditional (not gated on
+    // `running`).
+    DisposableEffect(Unit) {
+        viewModel.requestRealtimeHr()
+        onDispose { viewModel.releaseRealtimeHr() }
+    }
     var phase by remember { mutableStateOf(UiPhase.Inhale) }
     var phaseLabel by remember { mutableStateOf<String?>(null) }
     var stageIndex by remember { mutableIntStateOf(0) }
@@ -483,10 +491,13 @@ fun BreatheScreen(viewModel: AppViewModel) {
         // L3 passive stress check-in card (surfaces when StressOnsetDetector fires).
         StressCheckInCard(
             onBreatheNow = {
-                // Switch to Breathe and start a one-minute session. Coherence (5.5 br/min) is the
-                // resonance fallback pace; the felt cue is identical (one buzz in, two out).
+                // Switch to Breathe and start a one-minute session: at the locked resonance pace when the
+                // user has one and keeps "Use my resonance pace" on (as on iOS), else coherence (5.5
+                // br/min), the resonance fallback pace. The felt cue is identical (one buzz in, two out).
                 mode = BreatheMode.Breathe
-                pace = PaceSelection.Catalog("coherence_5_5")
+                val useLocked = BiofeedbackPrefs.checkInLockedPace(
+                    BiofeedbackPrefs.useResonancePace(context), lockedBpm) != null
+                pace = if (useLocked) PaceSelection.Resonance else PaceSelection.Catalog("coherence_5_5")
                 startSession()
             },
         )

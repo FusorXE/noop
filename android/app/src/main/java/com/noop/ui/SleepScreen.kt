@@ -26,7 +26,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Alarm
 import androidx.compose.material.icons.filled.Bedtime
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
@@ -43,11 +45,13 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.foundation.lazy.rememberLazyListState
+import kotlinx.coroutines.ensureActive
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import com.noop.data.DailyMetric
 import com.noop.data.HrBucket
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -73,6 +77,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.noop.analytics.AnalyticsEngine
 import com.noop.analytics.CircadianEngine
 import com.noop.analytics.HypnogramCoverage
+import com.noop.analytics.ScoreConfidence
 import com.noop.analytics.SleepEditGuard
 import com.noop.analytics.SleepGroupEdit
 import com.noop.analytics.SleepStageTotals
@@ -118,8 +123,15 @@ internal fun resolveSleepFreshness(
     syncFailed: Boolean,
 ): SleepFreshnessStatus? {
     if (syncing) return SleepFreshnessStatus.SYNCING
+    // #2108: a night already in hand outranks CALCULATING. It used to sit below, so `hasCurrentNight`
+    // could only silence the missing-night states and a finished night was structurally unable to
+    // silence this one: the banner said "detecting and staging the night now" directly above that same
+    // night scored, timed and staged on screen. A note that contradicts the content beside it is worse
+    // than no note, and one that is always on is read by nobody the day it matters. SYNCING stays above,
+    // because data still arriving can genuinely change what is shown.
+    if (hasCurrentNight) return null
     if (calculating) return SleepFreshnessStatus.CALCULATING
-    if (hasCurrentNight || !morningReady) return null
+    if (!morningReady) return null
     if (syncFailed) return SleepFreshnessStatus.SYNC_FAILED
     return if (syncedSinceDayStart) SleepFreshnessStatus.NOT_DETECTED
     else SleepFreshnessStatus.AWAITING_SYNC
@@ -180,6 +192,7 @@ private fun SleepFreshnessNote(status: SleepFreshnessStatus, chunks: Int) {
 fun SleepScreen(
     vm: AppViewModel,
     onOpenJournal: () -> Unit = {},
+    onOpenAlarms: () -> Unit = {},
 ) {
     val days by vm.recentDays.collectAsStateWithLifecycle()
     // Whether the ACTIVE strap is an Oura ring, off the canonical brand table (not an "oura" literal) — so
@@ -223,6 +236,9 @@ fun SleepScreen(
     // mergeSleep but WITHOUT the per-night collapse). Keyed on `days` so a sync/import (which always
     // rewrites dailyMetric too) reloads; these reads have no Flow. (#160, #170)
     var sleeps by remember { mutableStateOf<List<SleepSession>>(emptyList()) }
+    var loadedSleepDays by remember { mutableStateOf<List<DailyMetric>?>(null) }
+    var loadedSleepStrap by remember { mutableStateOf<String?>(null) }
+    val sleepRowsReady = loadedSleepDays == days && loadedSleepStrap == vm.activeStrapId
     // Durable deleted-night markers. Unlike the 7-second Undo banner these remain reachable after the
     // session row is gone, giving each suppressed window a "Recompute this night" escape hatch (#515).
     var dismissedSleeps by remember { mutableStateOf<List<DismissedSleep>>(emptyList()) }
@@ -232,8 +248,10 @@ fun SleepScreen(
     // `sleeps` in place WITHOUT touching `days`, so it must not reset the browse — keeping the
     // user on the night they just edited. (#160)
     var nightOffset by remember { mutableIntStateOf(0) }
-    LaunchedEffect(days) {
-        sleeps = runCatching {
+    LaunchedEffect(days, vm.activeStrapId) {
+        loadedSleepDays = null
+        val strap = vm.activeStrapId
+        val loaded = runCatching {
             val now = System.currentTimeMillis() / 1000L
             // Read the ACTIVE-strap ∪ canonical "my-whoop" union (#814/#1008), not the canonical id
             // alone: after a strap remove+re-add live nights land under the fresh "whoop-<uuid>" id, so
@@ -241,8 +259,8 @@ fun SleepScreen(
             // union-joined surface moved on (the #1014/#1009 stuck-sleep divergence, in the OTHER
             // direction). Exact-duplicate (startTs, endTs) blocks recorded under both ids are dropped;
             // naps/split blocks survive. Single-device installs collapse to one id, byte-identical.
-            val imported = vm.repo.sleepSessionsUnion(vm.activeStrapId, 0L, now)
-            val computed = vm.repo.computedSleepSessionsUnion(vm.activeStrapId, 0L, now)
+            val imported = vm.repo.sleepSessionsUnion(strap, 0L, now)
+            val computed = vm.repo.computedSleepSessionsUnion(strap, 0L, now)
             // Key by the LOCAL wake-day (#304), matching WhoopRepository.mergeSleep — a UTC key
             // mis-attributed a UTC+ user's early-morning wake to yesterday. REUSE the existing
             // dayString(ts, offsetSec) overload; do not add a new one (it clashes on the JVM).
@@ -257,7 +275,11 @@ fun SleepScreen(
             WhoopRepository.mergeSleepRichness(imported, computed) { localEndDay(it.endTs) }
                 .sortedBy { it.effectiveStartTs }
         }.getOrDefault(emptyList())
+        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+        sleeps = loaded
         nightOffset = 0
+        loadedSleepDays = days
+        loadedSleepStrap = strap
     }
 
     // Read the active∪canonical management union so a marker created before a strap re-add remains
@@ -520,6 +542,29 @@ fun SleepScreen(
     }
     val display = remember(model, night) { heroDisplay(model, night) }
 
+    val resultSnapshot = if (night != null && display != null) SleepResultSnapshot(
+        scope = "${vm.activeStrapId}:${(night.heroGroup.ifEmpty { listOf(night.session) }).map { it.deviceId }.distinct().sorted().joinToString(",")}:${night.dayKey}",
+        onset = night.heroOnsetTs ?: night.session.effectiveStartTs,
+        wake = night.heroWakeTs ?: night.session.endTs,
+        asleepMinutes = display.stages.asleep,
+        edited = night.session.userEdited || night.heroGroup.any { it.userEdited },
+    ) else null
+    val changeTracker = remember(vm.activeStrapId, nightOffset, resultSnapshot?.scope) { SleepResultChangeTracker() }
+    var resultChanged by remember(vm.activeStrapId, nightOffset, resultSnapshot?.scope) { mutableStateOf(false) }
+    var resultRevision by remember(vm.activeStrapId, nightOffset, resultSnapshot?.scope) { mutableIntStateOf(0) }
+    LaunchedEffect(resultSnapshot, sleepRowsReady, freshnessLive.analyzing, changeTracker) {
+        if (changeTracker.observe(resultSnapshot, sleepRowsReady && !freshnessLive.analyzing)) {
+            resultChanged = true
+            resultRevision++
+        }
+    }
+    LaunchedEffect(resultRevision, changeTracker) {
+        if (resultChanged) {
+            kotlinx.coroutines.delay(8_000)
+            resultChanged = false
+        }
+    }
+
     val sleepFreshness = remember(sleeps, freshnessLive) {
         val zone = ZoneId.systemDefault()
         val now = Instant.now().atZone(zone)
@@ -640,6 +685,14 @@ fun SleepScreen(
                 )
             }
         }
+        if (resultChanged) {
+            item {
+                DataPendingNote(
+                    title = stringResource(R.string.sleep_result_updated_title),
+                    body = stringResource(R.string.sleep_result_updated_message),
+                )
+            }
+        }
         sleepFreshness?.let { status ->
             item { SleepFreshnessNote(status, backfillNote ?: 0) }
         }
@@ -650,6 +703,7 @@ fun SleepScreen(
             item {
                 SleepEmptyState()
             }
+            item { SleepAlarmsEntry(onOpenAlarms) }
         } else {
             // REST HERO — a scenic indigo backdrop with the night's sleep-performance score as a
             // layered BevelGauge (Rest gradient), else a big rounded hours-slept headline. Mirrors the
@@ -669,6 +723,7 @@ fun SleepScreen(
                     overline = nightLabel,
                 )
             }
+            item { SleepAlarmsEntry(onOpenAlarms) }
             // #sleep-layout: a compact "Arrange" affordance (the same Tune entry Today uses) opens the
             // reorder / show-hide sheet. Pinned just above the arrangeable cards.
             item {
@@ -742,7 +797,9 @@ fun SleepScreen(
                 display = display,
                 activeIsOura = activeIsOura,
                 nightHr = nightHr,
-                clock = night?.clockLabel ?: model?.clockLabel,
+                // #2199: never the SleepModel's label here — that model resolves to the NEWEST night, not
+                // the browsed one. See navHeaderClockLabel, where the rule and its tests live.
+                clock = navHeaderClockLabel(night?.clockLabel, navDays, nightOffset, is24h),
                 nightOffset = nightOffset,
                 lastIndex = max(navDays.lastIndex, 0),
                 nightLabel = nightLabel,
@@ -944,6 +1001,19 @@ fun SleepScreen(
                 }
               }
             }
+        }
+    }
+}
+
+/** The existing alarm settings, reachable from Sleep with or without recorded nights. */
+@Composable
+private fun SleepAlarmsEntry(onOpenAlarms: () -> Unit) {
+    NoopCard(modifier = Modifier.clickable(onClick = onOpenAlarms), tint = Palette.restColor) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Metrics.gap)) {
+            Icon(Icons.Filled.Alarm, contentDescription = null, tint = Palette.restColor)
+            Text(stringResource(R.string.nav_alarms), style = NoopType.headline, color = Palette.textPrimary,
+                 modifier = Modifier.weight(1f))
+            Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Palette.textTertiary)
         }
     }
 }
@@ -1447,21 +1517,45 @@ private fun Hero(
             // so the larger Awake / smaller Deep+REM here isn't misread as the polished numbers the Oura app
             // shows for the same night (the app post-processes the same stream). Mirrors iOS ouraRawStagesNote.
             if (activeIsOura) OuraRawStagesNote()
+            // #H9: when the engine's Rest confidence flags this night's staging as low-confidence (a
+            // high-efficiency night whose deep+REM share is implausibly low, so a likely staging miss
+            // rather than a real night with no restorative sleep), say so honestly under the breakdown
+            // instead of presenting the suspect split as fact. Read straight off ScoreConfidence.forRest,
+            // the SAME engine call the daily pass uses, so the badge cannot disagree with the score.
+            // Efficiency prefers the stored value and falls back to asleep/in-bed, mirroring iOS
+            // efficiencyPct. Mirrors iOS SleepView.stageStagingIsLowConfidence.
+            // Stored first, as a fraction (rows have carried both 0..1 and 0..100); otherwise
+            // asleep/in-bed, capped, which is what iOS falls back to when no row value exists.
+            val h9Efficiency = session?.efficiency?.let { if (it <= 1.0) it else it / 100.0 }
+                ?: (if (s.total > 0.0) minOf(1.0, s.asleep / s.total) else null)
+            if (h9Efficiency != null &&
+                stageStagingIsLowConfidence(s.asleep, s.deep, s.rem, h9Efficiency)
+            ) {
+                SleepLowConfidenceNote()
+            }
+            // The blocks both caveats below read, hoisted so the two cannot consult a different set.
+            // `stagingSparse` is a DAY-level verdict stamped onto EVERY block (see iOS
+            // stageShowsIncompleteNote: "each carries the day's value"), so asking only the main block is
+            // asking one witness out of several. On a night whose main block is imported, and therefore
+            // carries a nil flag, while a computed fragment carries true, iOS warned and Android stayed
+            // silent, though both claimed to mirror each other.
+            val dayBlocks = sleepDayBlocks(session, heroGroup)
             // #345 follow-up: a night staged on SPARSE motion coverage can UNDER-detect and read short
-            // ("slept 8h, shows 1h"). Say so honestly, gated on the persisted stagingSparse flag (the day's
-            // SleepStager.isGravitySparse verdict). `session` is the REAL main block (selectNight's edit
-            // anchor), so it carries the flag; nil (imported / pre-migration) is never flagged. Mirrors iOS
-            // SleepView.stageIncompleteNote.
-            if (session?.stagingSparse == true) SleepIncompleteNote()
+            // ("slept 8h, shows 1h"). Say so honestly — but only when the night ACTUALLY reads short, since
+            // the stagingSparse flag alone fires on one long motion dropout at any night length. The rule
+            // and its reasoning live in [stageSparseNoteApplies]. A nil flag (imported / pre-migration
+            // block) is never itself a flag. Mirrors iOS SleepView.stageShowsIncompleteNote.
+            if (stageSparseNoteApplies(anyBlockStagingSparse(dayBlocks), s.asleep)) {
+                SleepIncompleteNote()
+            }
             // #1716 — a device-provided hypnogram assembled from records that never all arrived leaves a
             // HOLE in the timeline while the session still spans the whole night, so a night we saw a
             // fraction of renders as a complete one. Asked of the bridged main-night GROUP (the quantity
             // analyzeDay gates on), never of one fragment. This is the only place the coverage guard
             // becomes visible: the engine's matching Rest downgrade lands in a transient DayResult field
             // no screen reads. Mirrors iOS SleepView.stagePartialNote.
-            val coverageGroup = heroGroup.ifEmpty { listOfNotNull(session) }
             val stageCoverage = HypnogramCoverage.groupFraction(
-                coverageGroup.map {
+                dayBlocks.map {
                     HypnogramCoverage.Fragment(it.stagesJSON, (it.endTs - it.startTs).toDouble())
                 }
             )
@@ -1580,6 +1674,127 @@ private fun OuraRawStagesNote() {
             color = Palette.textTertiary,
         )
     }
+}
+
+/**
+ * Pure #H9 gate (unit-testable without a Composable) — true when a night's staging is low-confidence: a
+ * high-efficiency night whose deep+REM share is below the restorative floor. Built on the engine's own
+ * [ScoreConfidence.forRest] so the UI flag and the persisted Rest confidence agree. [asleepMin], [deepMin]
+ * and [remMin] are minutes; [efficiency] is asleep/in-bed in [0,1]. Returns false for an unstaged or
+ * zero-asleep night (no staging to doubt).
+ *
+ * Twin of Swift `SleepView.isStagingLowConfidence`. That one has carried "Mirror EXACTLY in Kotlin" since
+ * #H9 and had no Kotlin mirror: an Android night with high efficiency and implausibly little deep+REM was
+ * shown as fact while the same night warned on iPhone and Mac.
+ *
+ * Nothing flagged it, and no phrasing here would. The parity ledger's scope is the engine, protocol and
+ * storage packages; neither `Strand/Screens` nor `com/noop/ui` is scanned, so every mirror claim in the UI
+ * layer is unverified BY CONSTRUCTION. The reference above is written in a form the ledger would resolve,
+ * so it starts working the day the scope widens, but today it is a promise to a reader rather than a
+ * checked fact.
+ */
+internal fun stageStagingIsLowConfidence(
+    asleepMin: Double,
+    deepMin: Double,
+    remMin: Double,
+    efficiency: Double,
+): Boolean {
+    if (asleepMin <= 0.0) return false
+    val restorativeMin = maxOf(0.0, deepMin) + maxOf(0.0, remMin)
+    // An UNSTAGED night (no deep+REM at all) has no staging split to doubt — its base Rest confidence
+    // already reads honestly as BUILDING (NOT a downgrade), so it must never be flagged. Only a night that
+    // DID stage some sleep can be a suspicious "high efficiency yet implausibly little restorative" miss.
+    if (restorativeMin <= 0.0) return false
+    val tier = ScoreConfidence.forRest(
+        hasSession = true,
+        hasStagedSleep = true,
+        asleepSeconds = asleepMin * 60.0,
+        restorativeSeconds = restorativeMin * 60.0,
+        efficiency = efficiency,
+    )
+    // The H9 overload only DOWNGRADES SOLID to BUILDING on the suspicious case; a genuinely
+    // low-restorative-AND-low-efficiency night keeps its honest base tier and isn't flagged here.
+    return tier == ScoreConfidence.BUILDING &&
+        (restorativeMin / asleepMin) < ScoreConfidence.restorativeLowConfidenceShare &&
+        efficiency >= ScoreConfidence.highEfficiencyThreshold
+}
+
+/** The H9 low-confidence note shown beneath the stage breakdown: a warning-tinted badge plus a one-line
+ *  honest explanation. No faked stages, no tanked score, just a clear "treat this split with care" so a
+ *  user does not read a likely staging miss as a real deep/REM drought. Mirrors iOS stageLowConfidenceNote. */
+@Composable
+private fun SleepLowConfidenceNote() {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.Top,
+        modifier = Modifier.padding(horizontal = 2.dp),
+    ) {
+        SourceBadge(text = uiString(R.string.l10n_sleep_screen_low_confidence_99d4ceae), tint = Palette.statusWarning)
+        Text(
+            uiString(R.string.l10n_sleep_screen_this_night_scored_high_efficiency_but_a11d90eb),
+            style = NoopType.caption,
+            color = Palette.textTertiary,
+        )
+    }
+}
+
+/**
+ * The stored blocks the sleep caveats read: the bridged main-night GROUP, falling back to the single main
+ * block when the group is empty. Pure, so the CHOICE of blocks is testable rather than an inline
+ * expression buried in a Composable.
+ *
+ * Narrower than iOS, which reads `night.sourceBlocks`, every real block of the day. `Hero` is handed only
+ * `session` and `heroGroup`, so a block outside the group is not consulted here. Since `stagingSparse` is
+ * stamped on every block of the day, any block in the group carries it, which covers the reported shape;
+ * widening it would mean plumbing a new parameter.
+ */
+internal fun sleepDayBlocks(
+    session: SleepSession?,
+    heroGroup: List<SleepSession>,
+): List<SleepSession> = heroGroup.ifEmpty { listOfNotNull(session) }
+
+/**
+ * Whether ANY of the day's blocks carries the sparse-staging verdict.
+ *
+ * `stagingSparse` is a DAY-level flag stamped onto every block, which iOS states on its own gate ("each
+ * carries the day's value") and reads as `night.sourceBlocks.contains { $0.stagingSparse == true }`.
+ * Android asked the main block alone, so a night whose main block was imported (nil flag) while a computed
+ * fragment carried true warned on iPhone and Mac and stayed silent here, though both claimed to mirror
+ * each other. A nil flag is never itself a flag.
+ */
+internal fun anyBlockStagingSparse(blocks: List<SleepSession>): Boolean =
+    blocks.any { it.stagingSparse == true }
+
+/**
+ * Pure #345 gate (unit-testable without a Composable) — whether the "May be incomplete" caveat applies.
+ * Twin of Swift `SleepView.stageSparseNoteApplies`.
+ *
+ * [stagingSparse] alone is NOT the question the note asks. It is a STAGING-MECHANISM verdict:
+ * [SleepStager.isGravitySparse] returns true when the gravity span is short against the HR span OR when the
+ * LARGEST inter-sample gap exceeds `maxGapMin`, and its own doc calls that second branch "the typical WHOOP
+ * 4.0 backfill (#28)" whose only consequence is to ENABLE `buildRuns`' HR-vouched bridge. So a single long
+ * motion dropout sets it on a night of ANY length, including a complete twelve-hour one, and the flag is
+ * raised precisely where the engine has already applied its own mitigation.
+ *
+ * The note's copy, though, claims something narrower and checkable: that the night may be under-detected and
+ * the sleep total can read short. So require the total to actually read short. A night at or above the
+ * wearer's need cannot honestly be captioned as possibly reading short, whatever the motion trace looked
+ * like.
+ *
+ * A night that staged to NOTHING keeps the caveat: zero asleep is the strongest form of the collapse this
+ * note exists to explain, not an exemption from it.
+ *
+ * [needHours] is a parameter rather than a constant so a personalised need
+ * (`RestScorer.personalizedNeedHours`) can be threaded in later without moving the rule. It is
+ * computed per pass today and not persisted on a row a screen can reach, so the shared default stands in.
+ */
+internal fun stageSparseNoteApplies(
+    stagingSparse: Boolean,
+    asleepMin: Double,
+    needHours: Double = com.noop.analytics.RestScorer.defaultSleepNeedHours,
+): Boolean {
+    if (!stagingSparse) return false
+    return asleepMin < needHours * 60.0
 }
 
 /** The sparse-coverage caveat (#345): a night staged on thin motion data can under-detect and read short
@@ -1867,7 +2082,7 @@ private const val STAGE_ROW_SMOOTH_SEC = 90.0
 
 /**
  * iOS #988 port — the WHOOP-style per-stage timeline stack that replaces the flat hypnogram strip
- * for real-stage nights. Four tappable rows in WHOOP order (AWAKE · LIGHT · DEEP · REM), each a
+ * for real-stage nights. Four tappable rows in chart-depth order (AWAKE · REM · LIGHT · DEEP), each a
  * hatched full-night track with solid segments on the shared onset→wake axis; MotionStrip and the
  * clock-label axis sit under the rows on the SAME timeline; a fixed-height insight slot closes the
  * stack. The rows ARE the legend — no dot row, no footer. Mirrors SleepView.stageTimeline.
@@ -1897,9 +2112,9 @@ internal fun StageTimeline(
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.space8)) {
         listOf(
             Triple("Awake", s.awake, Palette.sleepAwake),
+            Triple("REM", s.rem, Palette.sleepREM),
             Triple("Light", s.light, Palette.sleepLight),
             Triple("Deep", s.deep, Palette.sleepDeep),
-            Triple("REM", s.rem, Palette.sleepREM),
         ).forEach { (label, minutes, color) ->
             StageTimelineRow(
                 label = label,
@@ -1914,7 +2129,13 @@ internal fun StageTimeline(
         }
         // #407 — MotionStrip component + data path untouched; relocated UNDER the rows on the SAME
         // timeline. Same inner insets as the rows' tracks so epochs don't skew against the segments.
-        Box(modifier = Modifier.padding(horizontal = Metrics.stageRowPadH)) {
+        // Column, not Box: `MotionStrip` emits its label AND its trace, and a Box stacks children in
+        // z-order, so the two would be drawn over each other. The Box was only ever carrying padding.
+        // Spacing matches the Swift `motionStrip`'s `VStack(alignment: .leading, spacing: 2)`.
+        Column(
+            modifier = Modifier.padding(horizontal = Metrics.stageRowPadH),
+            verticalArrangement = Arrangement.spacedBy(Metrics.space2),
+        ) {
             MotionStrip(motionEpochs)
         }
         if (onsetTs != null && wakeTs != null) {
@@ -2081,7 +2302,23 @@ internal fun stageSharePercent(label: String, s: Stages): Int {
  */
 @Composable
 private fun MotionStrip(epochs: List<Double>) {
+    // Emits TWO children, the label and then the trace, so the caller must lay them out vertically
+    // (see `StageTimeline`, which uses a Column for exactly this reason).
+    //
+    // The label names the strip (Android drew it unlabelled, so a wearer had no way to tell what the
+    // trace was) and states the scale in the same breath. The trace is normalised to THIS night's peak,
+    // so the tallest spike is full height whatever its absolute size and heights do not compare between
+    // nights. The strap calibrates no absolute magnitude, so saying "relative to tonight" is the honest
+    // axis label rather than a number. Twin of the Swift `motionStrip` label.
+    Text(
+        uiString(R.string.l10n_sleep_screen_move_relative_to_tonight_fd71d87b),
+        style = NoopType.footnote,
+        color = Palette.textTertiary,
+    )
     if (epochs.size < 2) {
+        // No explicit contentDescription: a Compose `Text` already exposes its own content to
+        // TalkBack, so the Apple side's `accessibilityLabel` is covering a SwiftUI need rather than
+        // a gap here, and a near-duplicate string would be ten more locale entries for nothing.
         Text(
             uiString(R.string.l10n_sleep_screen_no_movement_detail_for_this_night_a6f9736a),
             style = NoopType.footnote,

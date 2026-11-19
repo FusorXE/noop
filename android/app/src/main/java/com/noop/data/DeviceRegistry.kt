@@ -90,8 +90,8 @@ class DeviceRegistry(
                 dao.upsertPairedDevice(active.copy(id = serialId))
             }
             // BOTH id shapes. Every strap also owns a COMPUTED sibling keyed `<deviceId>-noop` (see
-            // WhoopRepository.computedDeviceId) holding the scored days, detected workouts and metric
-            // series the engine derives. That id never equals activeId, so re-keying only the pairing's
+            // WhoopRepository.computedDeviceId) holding scored days, legacy detected workouts and metric
+            // series. That id never equals activeId, so re-keying only the pairing's
             // own id left the computed history stranded under an id nothing reads again while the next
             // scoring pass wrote under `<serialId>-noop` — the orphaned history this adoption exists to
             // prevent, displaced onto the computed half. A ring has no computed sibling, which is why the
@@ -126,6 +126,7 @@ class DeviceRegistry(
         dao.reKeySteps(from, to); dao.deleteStepsFor(from)
         dao.reKeyPpgHr(from, to); dao.deletePpgHrFor(from)
         dao.reKeyPpgWaveform(from, to); dao.deletePpgWaveformFor(from)
+        dao.reKeyEcgWaveform(from, to); dao.deleteEcgWaveformFor(from)
         dao.reKeyV18Aux(from, to); dao.deleteV18AuxFor(from)
         dao.reKeyEvents(from, to); dao.deleteEventsFor(from)
         dao.reKeyBattery(from, to); dao.deleteBatteryFor(from)
@@ -142,6 +143,11 @@ class DeviceRegistry(
         dao.reKeyLiveSessions(from, to); dao.deleteLiveSessionsFor(from)
         dao.reKeyDismissedWorkouts(from, to); dao.deleteDismissedWorkoutsFor(from)
         dao.reKeyDismissedSleeps(from, to); dao.deleteDismissedSleepsFor(from)
+        dao.reKeyLiftExercises(from, to); dao.deleteLiftExercisesFor(from)
+        dao.reKeyLiftPrograms(from, to); dao.deleteLiftProgramsFor(from)
+        dao.reKeyLiftProgramItems(from, to); dao.deleteLiftProgramItemsFor(from)
+        dao.reKeyLiftSessions(from, to); dao.deleteLiftSessionsFor(from)
+        dao.reKeyLiftSets(from, to); dao.deleteLiftSetsFor(from)
     }
 
     /** Archive a device — keeps its row and samples (invariant I4). */
@@ -190,7 +196,8 @@ class DeviceRegistry(
      * delete-data op empties recordings; archiving/removing the registry entry is a separate op (I4).
      *
      * The table set is EVERY device-keyed table of [WhoopDatabase]: hrSample, rrInterval, spo2Sample,
-     * skinTempSample, respSample, gravitySample, stepSample, ppgHrSample, ppgWaveformSample, event, battery, dailyMetric,
+     * skinTempSample, respSample, gravitySample, stepSample, ppgHrSample, ppgWaveformSample,
+     * ecgWaveformSample, event, battery, dailyMetric,
      * sleepSession, journal, workout, appleDaily, metricSeries, dayOwnership, sleepStateSample, labMarker,
      * liveSession, dismissedWorkout, dismissedSleep. DeviceRegistryTest.deleteDeviceDataCallsEveryDaoDeleteMethod
      * guards completeness (fails if a delete*For DAO method isn't wired in here).
@@ -206,6 +213,7 @@ class DeviceRegistry(
             dao.deleteStepsFor(id)
             dao.deletePpgHrFor(id)
             dao.deletePpgWaveformFor(id)
+            dao.deleteEcgWaveformFor(id)
             dao.deleteV18AuxFor(id)
             dao.deleteEventsFor(id)
             dao.deleteBatteryFor(id)
@@ -223,6 +231,11 @@ class DeviceRegistry(
             dao.deleteLiveSessionsFor(id)
             dao.deleteDismissedWorkoutsFor(id)
             dao.deleteDismissedSleepsFor(id)
+            dao.deleteLiftExercisesFor(id)
+            dao.deleteLiftProgramsFor(id)
+            dao.deleteLiftProgramItemsFor(id)
+            dao.deleteLiftSessionsFor(id)
+            dao.deleteLiftSetsFor(id)
         }
     }
 
@@ -231,5 +244,13 @@ class DeviceRegistry(
         dao.setDayOwner(DayOwnershipRow(day = day, deviceId = deviceId, locked = locked))
 
     /** The owner override for a day, or null if none. */
-    suspend fun dayOwner(day: String): DayOwnershipRow? = dao.dayOwner(day)
+    suspend fun dayOwner(day: String): DayOwnershipRow? {
+        // Timed here rather than at the call site, matching the other per-day probes: the resolver that
+        // drives these sits inside `analyzeRecentOnCpu`, which has no ratchet margin for a stopwatch.
+        // See StoreProbeTally. Instrumentation only.
+        val started = System.nanoTime()
+        val row = dao.dayOwner(day)
+        com.noop.analytics.StoreProbeTally.recordDayOwner(System.nanoTime() - started)
+        return row
+    }
 }

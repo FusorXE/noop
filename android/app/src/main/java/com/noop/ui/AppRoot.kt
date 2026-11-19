@@ -94,6 +94,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -127,7 +128,7 @@ import com.noop.push.SelfHostedPushScreen
 // Routes whose screens belong to later waves point at a ComingSoon placeholder so the app compiles today.
 
 /** A single drawer destination: stable route, display title (localized via [titleRes]), sidebar icon. */
-private enum class Destination(
+internal enum class Destination(
     val route: String,
     @StringRes val titleRes: Int,
     val icon: ImageVector,
@@ -154,6 +155,10 @@ private enum class Destination(
 
     // Group: Insight
     Coach("coach", R.string.nav_coach, Icons.Filled.AutoAwesome),
+    // Coach settings (#2243), reached ONLY from the strip on the Coach page, so like [CoupledView]
+    // it is deliberately absent from every [DrawerGroup]: the drawer groups mirror the iOS More list
+    // one-for-one, and the iOS twin hangs off Coach in the same way.
+    CoachSettings("coach_settings", R.string.coach_settings, Icons.Filled.Tune),
     InsightsHub("insights_hub", R.string.nav_insights_hub, Icons.Filled.Insights),
     Insights("insights", R.string.nav_insights, Icons.Filled.Insights),
     Explore("explore", R.string.nav_explore, Icons.Filled.Explore),
@@ -217,19 +222,23 @@ private enum class Destination(
 // `more.expandedSections` CSV — see [MoreSectionPrefs]); it must NEVER be localized. [headerRes] is the
 // localized DISPLAY label the More page shows. Decoupling the two lets the label translate without
 // touching the persisted open/closed state or the iOS parity of the stored string.
-private data class DrawerGroup(
+internal data class DrawerGroup(
     val header: String,
     @StringRes val headerRes: Int,
     val items: List<Destination>,
     val defaultExpanded: Boolean,
 )
 
-// Mirrors the iOS RootTabView `moreTab` grouping + order one-for-one. Today / Trends / Sleep are NOT
-// listed (they're bottom-bar tabs, exactly as on iOS). Android-only screens (Vital Signs, Wake Window,
-// Notifications, Devices) are slotted into the matching iOS group.
-private val drawerGroups: List<DrawerGroup> = listOf(
+// Mirrors the iOS RootTabView `moreTab` grouping + order one-for-one. Today / Trends / Sleep / Coach
+// are NOT listed (they're bottom-bar tabs, exactly as on iOS). Android-only screens (Vital Signs, Wake
+// Window, Notifications, Devices) are slotted into the matching iOS group.
+internal val drawerGroups: List<DrawerGroup> = listOf(
     DrawerGroup("Insights", R.string.more_group_insights, listOf(
-        Destination.InsightsHub, Destination.Intelligence, Destination.Coach,
+        // Coach is a bottom-bar tab now and is deliberately absent here, matching iOS: "K3: Coach
+        // promoted to a top-level tab — no longer listed under More." Leaving it would have put the
+        // same destination in two places at once, which is the duplication the note above says this
+        // list exists to avoid. (#2218)
+        Destination.InsightsHub, Destination.Intelligence,
         Destination.Insights, Destination.Explore, Destination.Compare,
     ), defaultExpanded = true),
     DrawerGroup("Body", R.string.more_group_body, listOf(
@@ -290,8 +299,12 @@ internal object MoreSectionPrefs {
  * translating the bar away would leave an empty band rather than handing the space back to content —
  * visibly worse than not hiding at all. Auto-hide only makes sense over content.
  */
-internal fun shouldHideBar(autoHide: Boolean, overlay: Boolean, scrollingDown: Boolean): Boolean =
-    autoHide && overlay && scrollingDown
+internal fun shouldHideBar(
+    autoHide: Boolean,
+    overlay: Boolean,
+    scrollingDown: Boolean,
+    pinned: Boolean = false,
+): Boolean = !pinned && autoHide && overlay && scrollingDown
 
 /**
  * #1839: does this scroll delta change the direction, or is it noise?
@@ -351,6 +364,75 @@ object BottomBarStyleStore {
      */
     fun barHeightForContent(): Dp = if (overlay) barHeight else 0.dp
 
+    /**
+     * How see-through the bar's glass is, in EIGHT steps: 1 the most transparent, 8 solid.
+     *
+     * A step rather than a raw float so the two ends are reachable and every stop is repeatable - a
+     * continuous slider on a bar this small mostly produces values a user cannot tell apart or return to.
+     * The mapping is linear from 0.30 to 1.00, which puts the SHIPPED 0.80 exactly on step 6, so an
+     * install that never touches this is byte-identical to before.
+     */
+    var opacityStep by mutableStateOf(DEFAULT_OPACITY_STEP)
+        private set
+
+    /** The alpha for [opacityStep]. Step 1 = 0.30 ... step 6 = 0.80 (the shipped value) ... step 8 = 1.00. */
+    val barAlpha: Float get() = alphaForOpacityStep(opacityStep)
+
+    /**
+     * How much bigger the bar is drawn, from 1x to 2x.
+     *
+     * Scales the bar's CONTENT - icon, label and the padding around them - rather than applying a
+     * graphics scale to the finished bar, which would blur it and leave the touch targets where they
+     * were. The bar's height is measured and republished either way ([barHeight]), so screens keep
+     * clearing it correctly at any size without a second number to maintain.
+     */
+    var scale by mutableStateOf(DEFAULT_SCALE)
+        private set
+
+    /**
+     * Hold the bar visible regardless of auto-hide, while something is adjusting how it LOOKS.
+     *
+     * The transparency slider sits below the fold in Settings, so reaching it means scrolling down -
+     * which is exactly what auto-hide reads as "hide the bar". The control's live preview was therefore
+     * invisible at the moment it mattered, and touching the slider does not scroll, so nothing brought
+     * the bar back. Pinning while the drag is in flight is the narrowest fix: auto-hide is untouched as
+     * a setting, and the pin lasts only as long as a finger is down.
+     */
+    var previewPinned by mutableStateOf(false)
+        private set
+
+    /** Named `pinPreview` rather than `setPreviewPinned`: the latter is the property's own generated
+     *  setter, and declaring both is a JVM signature clash. */
+    fun pinPreview(value: Boolean) {
+        previewPinned = value
+    }
+
+    /**
+     * Move the bar NOW without persisting, for a slider drag.
+     *
+     * Separate from [setOpacityStep] because a drag emits a value per frame: persisting each one would
+     * write SharedPreferences dozens of times to record a decision the user makes once, on release. The
+     * card-opacity slider already splits it this way; this is the same split, not a new idea.
+     */
+    fun previewOpacityStep(step: Int) {
+        opacityStep = step.coerceIn(MIN_OPACITY_STEP, MAX_OPACITY_STEP)
+    }
+
+    /** Set and persist - for a committed choice, i.e. the end of a drag. */
+    fun setOpacityStep(ctx: Context, step: Int) {
+        val clamped = step.coerceIn(MIN_OPACITY_STEP, MAX_OPACITY_STEP)
+        opacityStep = clamped
+        NoopPrefs.of(ctx.applicationContext).edit()
+            .putInt(NoopPrefs.KEY_BOTTOM_BAR_OPACITY_STEP, clamped).apply()
+    }
+
+    fun setScale(ctx: Context, value: Float) {
+        val clamped = nearestScale(value)
+        scale = clamped
+        NoopPrefs.of(ctx.applicationContext).edit()
+            .putFloat(NoopPrefs.KEY_BOTTOM_BAR_SCALE, clamped).apply()
+    }
+
     /** #1839: hide the overlay bar while scrolling down, bring it back on scrolling up. Default ON. */
     var autoHide by mutableStateOf(true)
         private set
@@ -361,11 +443,52 @@ object BottomBarStyleStore {
             .putBoolean(NoopPrefs.KEY_BOTTOM_BAR_AUTO_HIDE, value).apply()
     }
 
+    /**
+     * Whether the AI Coach is offered at all. Default ON, so every existing install is unchanged.
+     *
+     * Lives here rather than being read straight from prefs at the call site because the bar has to
+     * RECOMPOSE when it flips: a plain `NoopPrefs.coachEnabled(ctx)` read inside the bar would be a
+     * snapshot taken once, and the tab would not appear or vanish until the next process start.
+     */
+    var coachEnabled by mutableStateOf(true)
+        private set
+
+    /**
+     * Flip the Coach master switch.
+     *
+     * Cancels the daily brief here rather than leaving each surface to notice, because the brief is the
+     * one Coach surface that runs with no UI attached: it is a separate default-off feature with its own
+     * `enabled` flag that calls a provider from the background and posts a notification. Hiding the tab
+     * alone would leave a wearer who had switched briefs on still getting AI output from a feature they
+     * had just turned off.
+     *
+     * Called in BOTH directions. `reschedule` already reads the master switch first and the brief's own
+     * flag second, so off cancels the work and clears the widget, and on re-arms it only if the wearer
+     * had briefs switched on. Doing this on the flip rather than leaving it to the next app start (where
+     * MainActivity reschedules anyway) keeps the brief's own settings row honest: it would otherwise read
+     * ON while nothing was scheduled, until something happened to relaunch the app.
+     */
+    fun setCoachEnabled(ctx: Context, value: Boolean) {
+        coachEnabled = value
+        val app = ctx.applicationContext
+        NoopPrefs.setCoachEnabled(app, value)
+        // Routed through `reschedule` rather than `cancel`, because cancelling the work is only half of
+        // switching the brief off: the widget keeps displaying the LAST generated brief, which is AI output
+        // still on the wearer's home screen after they turned the AI off. `reschedule` sees the master
+        // switch and does the right thing in both directions, so this is unconditional.
+        CoachBriefScheduler.reschedule(app)
+    }
+
     fun load(ctx: Context) {
-        overlay = NoopPrefs.of(ctx.applicationContext)
-            .getBoolean(NoopPrefs.KEY_OVERLAY_BOTTOM_BAR, true)
-        autoHide = NoopPrefs.of(ctx.applicationContext)
-            .getBoolean(NoopPrefs.KEY_BOTTOM_BAR_AUTO_HIDE, true)
+        val prefs = NoopPrefs.of(ctx.applicationContext)
+        overlay = prefs.getBoolean(NoopPrefs.KEY_OVERLAY_BOTTOM_BAR, true)
+        autoHide = prefs.getBoolean(NoopPrefs.KEY_BOTTOM_BAR_AUTO_HIDE, true)
+        coachEnabled = NoopPrefs.coachEnabled(ctx.applicationContext)
+        // Both are read through the same clamps the setters use, so a hand-edited or downgraded pref
+        // cannot put the bar in a state the UI has no way to leave.
+        opacityStep = prefs.getInt(NoopPrefs.KEY_BOTTOM_BAR_OPACITY_STEP, DEFAULT_OPACITY_STEP)
+            .coerceIn(MIN_OPACITY_STEP, MAX_OPACITY_STEP)
+        scale = nearestScale(prefs.getFloat(NoopPrefs.KEY_BOTTOM_BAR_SCALE, DEFAULT_SCALE))
     }
 
     fun set(ctx: Context, value: Boolean) {
@@ -376,7 +499,7 @@ object BottomBarStyleStore {
 }
 
 /**
- * App shell: a single [Scaffold] with a floating [GlassBottomBar] (Today · Trends · Sleep · More)
+ * App shell: a single [Scaffold] with a floating [GlassBottomBar] (Today · Trends · Sleep · Coach · More)
  * driving one [NavHost], mirroring the iOS RootTabView. There is NO global toolbar and no nav drawer
  * — every screen self-titles via [ScreenScaffold], and the "More" sheet (opened from the bar) reaches
  * every destination in [drawerGroups], so nothing is lost. A single [AppViewModel] is created here and
@@ -418,7 +541,8 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
     // Boolean, and only on a movement past the threshold, so a fingertip tremor cannot flicker the bar.
     var scrollingDown by remember { mutableStateOf(false) }
     val reduceMotion = rememberReduceMotion()
-    val hidden = shouldHideBar(BottomBarStyleStore.autoHide, BottomBarStyleStore.overlay, scrollingDown)
+    val hidden = shouldHideBar(BottomBarStyleStore.autoHide, BottomBarStyleStore.overlay, scrollingDown,
+                               pinned = BottomBarStyleStore.previewPinned)
     val collapseTarget = barCollapseFraction(hidden, reduceMotion)
     // The transform is a graphicsLayer only — GPU, per frame, NO relayout — so content never reflows as
     // the bar comes and goes and scrolling stays smooth. (The approach #90 got right.)
@@ -531,6 +655,9 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                         onOpenSleep = { nav.navigateTopLevel(Destination.Sleep.route) },
                         // Optional Coupled view card (task #43): a normal push so back returns to Today.
                         onOpenCoupled = { nav.navigate(Destination.CoupledView.route) },
+                        // #1862: the Coach launcher hands off here. Without this the sheet's buttons
+                        // would fall back to the parameter's no-op default and silently do nothing.
+                        onOpenCoach = { nav.navigateTopLevel(Destination.Coach.route) },
                         // The "workout in progress" indicator: raise the one-shot the Live screen consumes to
                         // re-open the in-exercise overlay, then route to Live. One tap from Today (iOS parity).
                         onOpenActiveWorkout = {
@@ -555,6 +682,7 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                     SleepScreen(
                         vm = viewModel,
                         onOpenJournal = { nav.navigateTopLevel(Destination.Insights.route) },
+                        onOpenAlarms = { nav.navigate(Destination.SmartAlarm.route) },
                     )
                 }
                 composable(Destination.CoupledView.route) {
@@ -566,7 +694,23 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                 }
                 composable(Destination.Intervals.route) { IntervalsScreen(viewModel) }
                 composable(Destination.Breathe.route) { BreatheScreen(viewModel) }
-                composable(Destination.Coach.route) { CoachScreen() }
+                composable(Destination.Coach.route) {
+                    // A normal push, so Back returns to the conversation (#2243).
+                    CoachScreen(onOpenSettings = { nav.navigate(Destination.CoachSettings.route) })
+                }
+                composable(Destination.CoachSettings.route) {
+                    // The SAME CoachViewModel the conversation is using, not a fresh one.
+                    // `viewModel()` resolves against LocalViewModelStoreOwner, which under
+                    // Navigation Compose is the NavBackStackEntry, so the default would hand this
+                    // destination its own instance. CoachViewModel keeps consent in memory
+                    // (`_consent`, seeded once at construction) and `send` passes that value to
+                    // `chatStream`, so a revoke made against a second instance would persist to
+                    // storage and still leave the conversation sending on the old one until its
+                    // entry was destroyed. Coach is always below this on the back stack: this
+                    // destination is reachable only from the strip on that screen.
+                    val coachEntry = remember(it) { nav.getBackStackEntry(Destination.Coach.route) }
+                    CoachSettingsScreen(vm = viewModel(coachEntry))
+                }
                 composable(Destination.Explore.route) { TrendsExploreScreen(viewModel) }
                 composable(Destination.Automations.route) { AutomationsScreen(viewModel) }
                 composable(Destination.SmartAlarm.route) { SmartAlarmScreen(viewModel) }
@@ -609,10 +753,7 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                 composable(Destination.InsightsHub.route) { InsightsHubScreen(viewModel) }
                 composable(Destination.LabBook.route) { LabBookScreen(viewModel) }
                 composable(Destination.Rhythm.route) {
-                    // EXPERIMENTAL: self-gates on its own consent clickwrap (default OFF). The night
-                    // summary + per-window Poincaré results land with the rhythm capture pipeline; until
-                    // then it renders its honest "no clear reading yet" empty state behind the gate.
-                    RhythmScreen(night = null, windows = emptyList())
+                    RhythmRoute(viewModel)
                 }
                 composable(Destination.FusedRecord.route) { FusedRecordRoute(viewModel) }
                 composable(Destination.AppleHealth.route) { AppleHealthScreen(viewModel) }
@@ -962,18 +1103,37 @@ private fun MoreRow(dest: Destination, onClick: () -> Unit) {
 // same destinations.
 
 /** A single bottom-bar nav slot: the destination it switches to, plus the bar-specific icon/label. */
-private data class BarTab(val dest: Destination, val icon: ImageVector, @StringRes val labelRes: Int)
+internal data class BarTab(val dest: Destination, val icon: ImageVector, @StringRes val labelRes: Int)
 
-/** The nav slots in iOS order: Today · Trends · Sleep · More.
+/** The nav slots in iOS order: Today · Trends · Sleep · Coach · More.
  *  More is special-cased (it opens the sheet rather than a route), so it is appended at the call site. */
-private val barLeadingTabs = listOf(
+internal val barLeadingTabs = listOf(
     BarTab(Destination.Today, Icons.Outlined.GridView, R.string.nav_today),
     // chart.line.uptrend.xyaxis on iOS — the rising-trend glyph, not a flat bar chart.
     BarTab(Destination.Trends, Icons.AutoMirrored.Filled.TrendingUp, R.string.nav_trends),
 )
-private val barTrailingTabs = listOf(
+/**
+ * The trailing tabs, as shipped. [barTrailingTabsFor] is what the bar actually draws: Coach is
+ * conditional, so this list is the full set rather than the visible one.
+ */
+internal val barTrailingTabs = listOf(
     BarTab(Destination.Sleep, Icons.Filled.Bedtime, R.string.nav_sleep),
+    // #2218: Coach was promoted to a top-level tab on iOS and this side did not follow, so it sat in
+    // the More list while the comment above claimed the two bars matched. AutoAwesome is the sparkles
+    // glyph iOS uses, and the same one the More row already shows, so the entry a wearer has learned
+    // keeps its face when it moves up.
+    BarTab(Destination.Coach, Icons.Filled.AutoAwesome, R.string.nav_coach),
 )
+
+/**
+ * The trailing tabs to draw for a given Coach setting.
+ *
+ * A function rather than a filter written inline at the bar so the Kotlin unit tests can assert the
+ * two shapes directly, and so every surface that needs "which tabs are there" agrees by construction
+ * instead of by two copies of the same predicate.
+ */
+internal fun barTrailingTabsFor(coachEnabled: Boolean): List<BarTab> =
+    if (coachEnabled) barTrailingTabs else barTrailingTabs.filterNot { it.dest == Destination.Coach }
 
 @Composable
 private fun GlassBottomBar(
@@ -981,6 +1141,10 @@ private fun GlassBottomBar(
     onTabSelected: (Destination) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // One binding, used by BOTH the slots and the More-lit predicate below. #2218's note applies here
+    // twice over: a second copy of "which tabs exist" is what let Coach light two slots at once, and a
+    // conditional tab makes that failure available again to anyone who filters in one place only.
+    val visibleTrailing = barTrailingTabsFor(BottomBarStyleStore.coachEnabled)
     val barShape = RoundedCornerShape(50)
     Box(
         modifier = modifier
@@ -998,7 +1162,9 @@ private fun GlassBottomBar(
             // "Glass": a translucent raised surface — a frosted island, not a hard slab. Compose has no
             // cheap blur, so translucency (≈0.80) + a hairline rim is the Liquid-Glass stand-in. A soft,
             // low drop shadow reads as floating without a glow.
-            color = Palette.surfaceRaised.copy(alpha = 0.80f),
+            // The glass alpha is the user's transparency step; 0.80 was the shipped constant and remains
+            // the default (step 6), so an untouched install is unchanged.
+            color = Palette.surfaceRaised.copy(alpha = BottomBarStyleStore.barAlpha),
             tonalElevation = 2.dp,
             shadowElevation = 4.dp,
             modifier = Modifier
@@ -1010,7 +1176,11 @@ private fun GlassBottomBar(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 8.dp, vertical = 7.dp),
+                    // Scaling the PADDING and the slot contents grows the bar honestly - the touch
+                    // targets grow with it, and `barHeight` is measured afterwards so screens keep
+                    // clearing the bar at any size. A graphics scale would blur it and leave the hit
+                    // areas behind.
+                    .padding(horizontal = 8.dp, vertical = 7.dp * BottomBarStyleStore.scale),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(2.dp),
             ) {
@@ -1023,7 +1193,7 @@ private fun GlassBottomBar(
                         onClick = { onTabSelected(tab.dest) },
                     )
                 }
-                barTrailingTabs.forEach { tab ->
+                visibleTrailing.forEach { tab ->
                     BarSlot(
                         icon = tab.icon,
                         label = stringResource(tab.labelRes),
@@ -1036,10 +1206,14 @@ private fun GlassBottomBar(
                     icon = Icons.Filled.MoreHoriz,
                     label = stringResource(R.string.nav_more),
                     // Selected on the More page itself, and also kept lit whenever the current screen is
-                    // one reached THROUGH More (i.e. not one of the bar's own three tabs) — so drilling
-                    // into any grouped destination still reads as "you're in More", never "nowhere".
-                    active = current != Destination.Today && current != Destination.Trends &&
-                        current != Destination.Sleep,
+                    // one reached THROUGH More (i.e. not one of the bar's own tabs) — so drilling into
+                    // any grouped destination still reads as "you're in More", never "nowhere".
+                    //
+                    // Derived from the bar's own lists rather than restated. Spelling the tabs out here
+                    // is what made adding Coach a two-part change: the slot alone would have lit Coach
+                    // AND More together, because this predicate had never heard of it. (#2218)
+                    active = barLeadingTabs.none { it.dest == current } &&
+                        visibleTrailing.none { it.dest == current },
                     modifier = Modifier.weight(1f),
                     onClick = { onTabSelected(Destination.More) },
                 )
@@ -1067,19 +1241,29 @@ private fun BarSlot(
                 indication = null,
                 onClick = onClick,
             )
-            .padding(vertical = 3.dp)
+            .padding(vertical = 3.dp * BottomBarStyleStore.scale)
             .semantics { contentDescription = label },
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
-        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(Metrics.iconSmall))
+        // Icon and label scale together with the padding above, so the slot grows as one piece rather
+        // than a bigger box around the same small glyph.
+        Icon(icon, contentDescription = null, tint = tint,
+             modifier = Modifier.size(Metrics.iconSmall * BottomBarStyleStore.scale))
         Text(
             label,
             style = NoopType.footnote.copy(
-                fontSize = 10.sp,
+                fontSize = 10.sp * BottomBarStyleStore.scale,
                 fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
             ),
             color = tint,
+            // #2218: one line, always. A fifth slot takes about a fifth off every label's width, and the
+            // bar scale goes to 2x, so the longest of them can no longer be assumed to fit on a narrow
+            // phone. Wrapping would not break anything, since `barHeight` is measured afterwards and
+            // screens clear whatever it comes to, but a two-line nav bar at one size and a one-line bar
+            // at the next is the kind of thing nobody reports and everybody notices.
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }

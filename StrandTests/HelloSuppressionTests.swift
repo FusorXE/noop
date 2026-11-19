@@ -114,14 +114,23 @@ final class HelloSuppressionTests: XCTestCase {
         let hint = BondRefusalGiveUp.helloSuppressedHint()
         XCTAssertTrue(hint.contains("live heart rate keeps streaming"))
         XCTAssertTrue(hint.contains("History sync stays unavailable"))
-        XCTAssertTrue(hint.contains("Tap Connect"))
+        // #1635 follow-up: the hint no longer LEADS with a retry. Framing a strap that refuses pairing as
+        // a retryable failure invited the hammering the give-up latch exists to stop, and a field report
+        // read the whole hint and still asked how to fix it. Pairing mode comes first now; Connect follows.
+        XCTAssertTrue(hint.contains("pairing mode"))
+        XCTAssertTrue(hint.contains("tap Connect"))
+        // And it must NOT claim these are unavailable: since #1884 an HR-only night reports both.
+        XCTAssertFalse(hint.contains("HRV and resting heart rate are unavailable"))
         // The hint must name what an unbonded strap actually costs, not just history sync: motion,
-        // skin temperature, SpO2 and respiratory stop, so sleep falls to the HR-only stager and HRV
-        // + resting HR are nulled. A field log showed a week of blank Recovery Vitals under the old
-        // wording, which pointed only at a feature the user was not missing.
+        // skin temperature, SpO2 and respiratory stop, so sleep falls to the HR-only stager. A field log
+        // showed a week of blank Recovery Vitals under the old wording, which pointed only at a feature
+        // the user was not missing. (It used to end "and HRV + resting HR are nulled" — #1884 made that
+        // false, and leaving it here would have contradicted the assertion four lines down.)
         XCTAssertTrue(hint.contains("motion"))
-        XCTAssertTrue(hint.contains("HRV"))
-        XCTAssertTrue(hint.contains("resting heart rate"))
+        // #1884 repinned the tail of this: naming HRV and resting HR as LOSSES stopped being true when an
+        // HR-only night began reporting both. What survives from #1878 is the reason they were named at
+        // all - the strap stops sending motion, so sleep falls to the HR-only stager. That still holds.
+        XCTAssertTrue(hint.contains("staged from heart rate alone"))
         XCTAssertFalse(hint.lowercased().contains("paused"))
         XCTAssertFalse(hint.lowercased().contains("stopped retrying"))
     }
@@ -200,4 +209,28 @@ final class HelloSuppressionTests: XCTestCase {
         }
     }
 
+
+    /// #2332: the band that decides whether a link RSSI reading reaches the epitaph. Twin of the Kotlin
+    /// `RssiReadingBandTest`. The value this guards against is 127, the BLE spec's "RSSI is not
+    /// available": recording it would put an extremely strong reading on a link that died, which argues
+    /// the radio was fine and sends the next reader of that log looking anywhere but at range.
+    func testRssiReadingBand() {
+        // The field report behind #2332: median -92, min -96, best -48.
+        for rssi in [-96, -93, -92, -87, -76, -63, -48] {
+            XCTAssertTrue(rssiReadingIsUsable(rssi), "\(rssi) dBm is a real reading")
+        }
+        XCTAssertFalse(rssiReadingIsUsable(127), "127 is the spec's 'not available'")
+        // A band, not `!= 127`: anything outside the spec's range is rejected too.
+        XCTAssertFalse(rssiReadingIsUsable(21))
+        XCTAssertFalse(rssiReadingIsUsable(100))
+        XCTAssertFalse(rssiReadingIsUsable(Int.max))
+        XCTAssertFalse(rssiReadingIsUsable(-128))
+        XCTAssertFalse(rssiReadingIsUsable(Int.min))
+        // Bounds are inclusive, pinned so a later tightening cannot quietly move an edge.
+        XCTAssertTrue(rssiReadingIsUsable(-127))
+        XCTAssertTrue(rssiReadingIsUsable(20))
+        // 0 is not reachable on a real link, so it is a plausible sentinel for a stack to invent, but the
+        // spec permits it: KEPT rather than discarding a spec-valid reading on a guess.
+        XCTAssertTrue(rssiReadingIsUsable(0), "0 is inside the spec's range, so it is kept")
+    }
 }

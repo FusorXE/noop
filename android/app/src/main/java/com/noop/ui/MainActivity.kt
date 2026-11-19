@@ -118,6 +118,9 @@ class MainActivity : ComponentActivity() {
         // feature is off). Wrapped because a WorkManager hiccup must never block launch.
         runCatching { DebugExportScheduler.reschedule(applicationContext) }
 
+        // K5: self-heal the scheduled Coach morning-brief job (no-op when off / already scheduled).
+        runCatching { CoachBriefScheduler.reschedule(applicationContext) }
+
         // Backup & Sync (#791): self-heal the daily auto-backup schedule (no-op when off / no folder),
         // and run a DEFERRED on-launch catch-up backup. Must-fix #4: the catch-up is gated on the toggle
         // being ON, runs fully off the main thread on Dispatchers.IO, and is launched AFTER the
@@ -256,6 +259,19 @@ object NoopPrefs {
     /** "Keep connected in the background", drives [com.noop.ble.WhoopConnectionService]. Default on. */
     const val KEY_BACKGROUND_CONNECTION = "noop.backgroundConnection"
 
+    /** Boundary used by additive daily metrics. Sleep onset is the product default; midnight restores
+     * the conventional civil-day view. Naps never become boundaries. */
+    const val KEY_DAY_CYCLE_MODE = "noop.dayCycleMode"
+
+    fun dayCycleMode(context: Context): com.noop.analytics.DayCycleMode =
+        com.noop.analytics.DayCycleMode.fromPersisted(
+            of(context).getString(KEY_DAY_CYCLE_MODE, null),
+        )
+
+    fun setDayCycleMode(context: Context, mode: com.noop.analytics.DayCycleMode) {
+        of(context).edit().putString(KEY_DAY_CYCLE_MODE, mode.persistedValue).apply()
+    }
+
     /** "Continuous HRV capture", when on (AND background connection is on), NOOP holds the dense
      *  realtime HR stream armed even with no Live screen open, so the strap banks beat-to-beat R-R 24/7
      *  for far better overnight HRV/recovery/sleep. Uses more battery (continuous HR streaming). Default
@@ -333,6 +349,7 @@ object NoopPrefs {
     const val KEY_HR_BROADCAST = "noop.hrBroadcast"
 
     const val KEY_ANALYZE_WATERMARK = "noop.analyzeWatermark"
+    const val KEY_STEPS_MOTION_CACHE = "noop.stepsMotionCache.v1"
 
     /** "Power saving" (#477): when on, NOOP stretches its periodic strap-sync cadence (15 → 45 min) while
      *  the STRAP is discharging at/below [KEY_POWER_SAVING_BATTERY_PCT].
@@ -477,6 +494,17 @@ object NoopPrefs {
 
     fun setAnalyzeWatermark(context: Context, fingerprint: String) {
         of(context).edit().putString(KEY_ANALYZE_WATERMARK, fingerprint).apply()
+    }
+
+    /** The persisted steps-calibration motion folds (see `StepsMotionCache`). A derived cache, so a missing
+     *  or unreadable payload costs one re-fold and nothing else; versioned in the key as well as in the
+     *  payload header so a format change cannot even be read. Mirrors the Swift
+     *  `analyzeRecent.stepsMotionCache.v1` UserDefaults key. */
+    fun stepsMotionCache(context: Context): String? =
+        of(context).getString(KEY_STEPS_MOTION_CACHE, null)
+
+    fun setStepsMotionCache(context: Context, payload: String) {
+        of(context).edit().putString(KEY_STEPS_MOTION_CACHE, payload).apply()
     }
 
     /** Whether NOOP should hold the strap connection open via a foreground service. Default true. */
@@ -660,6 +688,20 @@ object NoopPrefs {
         of(context).edit().putBoolean(KEY_OURA_ONSET_KEYING, enabled).apply()
     }
 
+    /** Oura packed-notification A/B (EXPERIMENTAL, default OFF): send the official app's SetNotification mask
+     *  `1c 01 ff` at the next connect instead of NOOP's `3f`. The ring packs ~10 packets per notification for
+     *  the official app (9x the drain throughput) and NOOP's session never gets that shape; the mask is the
+     *  first candidate switch (OURA_PROTOCOL.md s2.3). Read once per connect, so turning it off restores `3f`
+     *  on the next session — nothing persists on the ring. Twin of iOS AppModel.ouraNotifyMaskFullKey. */
+    const val KEY_OURA_NOTIFY_MASK_FULL = "noop.ouraNotifyMaskFull"
+
+    fun ouraNotifyMaskFull(context: Context): Boolean =
+        of(context).getBoolean(KEY_OURA_NOTIFY_MASK_FULL, false)
+
+    fun setOuraNotifyMaskFull(context: Context, enabled: Boolean) {
+        of(context).edit().putBoolean(KEY_OURA_NOTIFY_MASK_FULL, enabled).apply()
+    }
+
     /** #1121: whether the opt-in "detailed capture" rolling strap-log file is on. Persisted so capture
      *  RESUMES after the process is killed (AppViewModel re-arms the BLE client from this on launch). */
     const val KEY_DETAILED_CAPTURE = "noop.detailedCapture"
@@ -705,6 +747,12 @@ object NoopPrefs {
      *  ON (#1841). Only meaningful with the overlay layout, where the bar sits over content. */
     const val KEY_BOTTOM_BAR_AUTO_HIDE = "noop.bottomBarAutoHide"
 
+    /** #1836 follow-up: the bar's glass alpha, as one of eight steps. See [com.noop.ui.alphaForOpacityStep]. */
+    const val KEY_BOTTOM_BAR_OPACITY_STEP = "noop.bottomBarOpacityStep"
+
+    /** #1836 follow-up: how much bigger the bar is drawn, one of [com.noop.ui.BOTTOM_BAR_SCALES]. */
+    const val KEY_BOTTOM_BAR_SCALE = "noop.bottomBarScale"
+
     /** #1836: draw the bottom bar as an overlay (glass over the screen's backdrop) instead of a reserved
      *  Scaffold slot. Default ON (#1841), after the overlay was confirmed on a device. */
     const val KEY_OVERLAY_BOTTOM_BAR = "noop.overlayBottomBar"
@@ -713,10 +761,10 @@ object NoopPrefs {
      *  with the Apple @AppStorage binding via [com.noop.analytics.ClockFormatPreference]. */
     const val KEY_CLOCK_FORMAT = com.noop.analytics.ClockFormatPreference.PREFS_KEY
 
-    /** Imperial/Metric display preference (D#103). Display-only, stored data stays SI. The length/mass
-     *  system is read by [UnitPrefs.system]; the temperature override (empty = "match the system") by
-     *  [UnitPrefs.temperature]. Mirrors macOS @AppStorage("units.system" / "units.temperature"). */
+    /** Display-only unit preferences; stored data stays SI. `units.system` remains the body preference
+     *  for compatibility, while exercise distance can override it independently. */
     const val KEY_UNIT_SYSTEM = "units.system"
+    const val KEY_DISTANCE_UNIT_SYSTEM = "units.distance"
     const val KEY_TEMPERATURE_UNIT = "units.temperature"
 
     /** #1846: which skin-temp number the cards lead with — "" / absent = a temperature (default), or the
@@ -725,6 +773,10 @@ object NoopPrefs {
 
     fun setUnitSystem(context: Context, system: UnitSystem) {
         of(context).edit().putString(KEY_UNIT_SYSTEM, system.raw).apply()
+    }
+
+    fun setDistanceUnitSystem(context: Context, system: UnitSystem) {
+        of(context).edit().putString(KEY_DISTANCE_UNIT_SYSTEM, system.raw).apply()
     }
 
     /** Persist the temperature override, or pass null to clear it back to "match the system". */
@@ -1053,6 +1105,63 @@ object NoopPrefs {
         of(context).edit().putBoolean(KEY_QUIET_MOTION, enabled).apply()
     }
 
+    /** Which gauge Today draws: the GlowRing arc (default) or the liquid vessel it replaced (#2311).
+     *
+     *  Android-only, and deliberately NOT Apple's `noop.liquidTodayEnabled`. That key switches between two
+     *  whole Today SCREENS on iOS and macOS, `LiquidTodayView` (the default there) and the classic
+     *  `TodayView`. Android has a single Today screen, so this chooses a gauge inside it and nothing else.
+     *
+     *  Sharing the key would also INVERT it: `true` means liquid on Apple and rings (not liquid) here, so
+     *  one stored value would drive two opposite looks. Two unrelated meanings on one setting, and a future
+     *  divergence on either platform silently wrong.
+     *
+     *  Defaults to the rings, which is what #2311 shipped; the vessels stay available for anyone who
+     *  preferred them. */
+    const val KEY_TODAY_RING_GAUGES = "noop.todayRingGauges"
+
+    fun todayRingGauges(context: Context): Boolean =
+        of(context).getBoolean(KEY_TODAY_RING_GAUGES, true)
+
+    fun setTodayRingGauges(context: Context, enabled: Boolean) {
+        of(context).edit().putBoolean(KEY_TODAY_RING_GAUGES, enabled).apply()
+    }
+
+    /**
+     * When the live /models catalogue was last pulled for a provider, epoch millis, keyed per
+     * provider so switching does not hide a stale list behind another provider's refresh.
+     *
+     * Exists so the model picker can carry what the provider offers TODAY without this app shipping a
+     * new build for every model release. The built-in lists stay as the offline seed.
+     */
+    fun coachModelsRefreshedAt(context: Context, provider: String): Long =
+        of(context).getLong("noop.coachModelsRefreshed.$provider", 0L)
+
+    fun setCoachModelsRefreshedAt(context: Context, provider: String, atMillis: Long) {
+        of(context).edit().putLong("noop.coachModelsRefreshed.$provider", atMillis).apply()
+    }
+
+    /** Master switch for the AI Coach, offered in Settings under Bottom bar because the Coach tab is
+     *  what a wearer sees it as (#2218 promoted Coach to a top-level tab). Default ON, matching every
+     *  install that shipped with the tab.
+     *
+     *  This is NOT tab chrome. Turning it off disables the AI itself: the tab goes, the Today launcher
+     *  card goes, and the daily brief scheduler is cancelled. That last one is why this is a single pref
+     *  rather than a per-surface hide - CoachBriefScheduler is a SEPARATE default-off feature with its
+     *  own `enabled` flag that makes a provider call from the background and posts a notification, so
+     *  hiding only the tab would leave a wearer who had enabled briefs still receiving AI output from a
+     *  feature they had just switched off.
+     *
+     *  Saved provider keys are deliberately KEPT. The switch is meant to be reversible, and wiping a key
+     *  a wearer pasted in would make turning it back on a re-setup rather than a flip. */
+    const val KEY_COACH_ENABLED = "noop.coachEnabled"
+
+    fun coachEnabled(context: Context): Boolean =
+        of(context).getBoolean(KEY_COACH_ENABLED, true)
+
+    fun setCoachEnabled(context: Context, enabled: Boolean) {
+        of(context).edit().putBoolean(KEY_COACH_ENABLED, enabled).apply()
+    }
+
     /** Coach on-device signals (v5): when ON, the opt-in BYO-key Coach's grounding context may include a
      *  SUMMARY-ONLY line of on-device correlations + Lab Book markers (no raw egress). A SECOND opt-in on
      *  top of the existing "let the coach use my data" consent. Default OFF, keeps the anonymity posture. */
@@ -1063,6 +1172,18 @@ object NoopPrefs {
 
     fun setCoachSignals(context: Context, enabled: Boolean) {
         of(context).edit().putBoolean(KEY_COACH_SIGNALS, enabled).apply()
+    }
+
+    /** K11: Coach multimodal chart image (opt-in, default OFF). When ON and the provider is Gemini,
+     *  a chart snapshot is sent as inline_data alongside the text. A THIRD opt-in on top of the
+     *  existing data consent. Only Gemini supports multimodal input. */
+    const val KEY_COACH_MULTIMODAL = "noop.coachMultimodal"
+
+    fun coachMultimodal(context: Context): Boolean =
+        of(context).getBoolean(KEY_COACH_MULTIMODAL, false)
+
+    fun setCoachMultimodal(context: Context, enabled: Boolean) {
+        of(context).edit().putBoolean(KEY_COACH_MULTIMODAL, enabled).apply()
     }
 
     /** The user's EDITED Coach system prompt. Empty/absent means "use the built-in default". A small,
@@ -1084,7 +1205,8 @@ object NoopPrefs {
     /** "Auto-detect workouts" (MVP, opt-in, on-device, NON-DESTRUCTIVE). When ON, NOOP scans the last
      *  day or two of strap HR for a sustained-elevated bout and surfaces ONE dismissible Today card
      *  suggesting you save it, it NEVER creates a workout on its own (the user taps Save). Default OFF;
-     *  when off no detection runs and no card shows. Mirrors macOS/iOS @AppStorage("autoDetectWorkouts"). */
+     *  when off no detection runs and no card shows, while existing workout history is retained. Mirrors
+     *  macOS/iOS @AppStorage("autoDetectWorkouts"). */
     const val KEY_AUTO_DETECT_WORKOUTS = "noop.autoDetectWorkouts"
 
     fun autoDetectWorkouts(context: Context): Boolean =
@@ -1110,6 +1232,24 @@ object NoopPrefs {
 
     fun setIllnessLastNotifiedDay(context: Context, day: String) {
         of(context).edit().putString(KEY_ILLNESS_LAST_NOTIFIED_DAY, day).apply()
+    }
+
+    /** Whether the illness banner was RAISED at the last evaluation, persisted so the clear-to-raised
+     *  edge survives process death. It used to live only in memory (a service field and a StateFlow
+     *  that starts null), so every cold start re-armed the edge and the once-a-day gate then allowed a
+     *  fresh notification about an alert that had not transitioned at all (#2586). */
+    const val KEY_ILLNESS_WAS_RAISED = "noop.illnessWasRaised"
+
+    /** Null means no evaluable history has established a previous state yet. Treating it as clear
+     *  would invent a transition on upgrade when an existing two-night warning is already raised. */
+    fun illnessWasRaised(context: Context): Boolean? {
+        val prefs = of(context)
+        return if (prefs.contains(KEY_ILLNESS_WAS_RAISED))
+            prefs.getBoolean(KEY_ILLNESS_WAS_RAISED, false) else null
+    }
+
+    fun setIllnessWasRaised(context: Context, raised: Boolean) {
+        of(context).edit().putBoolean(KEY_ILLNESS_WAS_RAISED, raised).apply()
     }
 
     /** Battery alerts, low (≤15%) + charge-complete (100%) strap notifications (#368, thanks @ujix).
@@ -1146,6 +1286,18 @@ object NoopPrefs {
 
     fun setBatteryLowAlerted(context: Context, alerted: Boolean) {
         of(context).edit().putBoolean(KEY_BATTERY_LOW_ALERTED, alerted).apply()
+    }
+
+    /** The banked reading `onStrapNotSeen` last warned about, as its epoch SECONDS (#2556). Keyed on the
+     *  reading rather than a boolean so one stale value cannot re-notify on every app open, while a NEWER
+     *  low reading still counts as a new fact. 0 means never. */
+    const val KEY_BATTERY_STALE_ALERTED_TS = "noop.batteryStaleAlertedTs"
+
+    fun batteryStaleAlertedTs(context: Context): Long? =
+        of(context).getLong(KEY_BATTERY_STALE_ALERTED_TS, 0L).takeIf { it > 0L }
+
+    fun setBatteryStaleAlertedTs(context: Context, ts: Long) {
+        of(context).edit().putLong(KEY_BATTERY_STALE_ALERTED_TS, ts).apply()
     }
 
     fun batteryFullAlerted(context: Context): Boolean =
@@ -1290,6 +1442,16 @@ object NoopPrefs {
         of(context).edit().putBoolean(KEY_EFFORT_RESCORE_DONE, true).apply()
     }
 
+    /** Full-history sleep wear repair is marked only after the source rescore returns successfully. */
+    const val KEY_SLEEP_WEAR_RESCORE_DONE = "intelligence.sleepWearRescore.v1.done"
+
+    fun sleepWearRescoreDone(context: Context): Boolean =
+        of(context).getBoolean(KEY_SLEEP_WEAR_RESCORE_DONE, false)
+
+    fun setSleepWearRescoreDone(context: Context) {
+        of(context).edit().putBoolean(KEY_SLEEP_WEAR_RESCORE_DONE, true).apply()
+    }
+
     /** Whether the one-shot #547 implausible-timestamp heal has run. Set true once it completes so the
      *  on-upgrade purge of bad-strap-clock rows (far-past / future-dated) never re-runs. Re-running is
      *  harmless (the deletes are idempotent), but the flag avoids the work on every launch. */
@@ -1357,6 +1519,18 @@ object NoopPrefs {
      *  than writing to a key that belongs to no device. */
     fun setLastSyncAtFor(context: Context, peripheralId: String?, epochSec: Long) {
         val key = com.noop.ble.lastSyncPrefKey(peripheralId) ?: return
+        of(context).edit().putLong(key, epochSec).apply()
+    }
+
+    /** This strap's own newest banked-record timestamp, keyed by BLE address — see
+     *  [com.noop.ble.strapClockPrefKey]. 0 when this strap has never reported a range. */
+    fun strapNewestRecordTsFor(context: Context, peripheralId: String?): Long =
+        com.noop.ble.strapClockPrefKey(peripheralId)?.let { of(context).getLong(it, 0L) } ?: 0L
+
+    /** Stamp a range reply against the strap that sent it. A blank address writes nothing rather than
+     *  writing to a key that belongs to no device. */
+    fun setStrapNewestRecordTsFor(context: Context, peripheralId: String?, epochSec: Long) {
+        val key = com.noop.ble.strapClockPrefKey(peripheralId) ?: return
         of(context).edit().putLong(key, epochSec).apply()
     }
 
